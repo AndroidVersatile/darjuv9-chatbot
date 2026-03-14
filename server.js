@@ -8,13 +8,18 @@ const app = express().use(bodyParser.json());
 const token = process.env.ACCESS_TOKEN;
 const phone_number_id = process.env.PHONE_NUMBER_ID;
 const verify_token = process.env.MY_SCRETE_TOKEN;
+const BASE_URL = process.env.BASE_URL || 'http://www.darjuv9.com/webservice/Service.asmx';
 
 const userState = {};
 const userData = {};
-if (!token || !phone_number_id) {
-    console.warn("Missing META_ACCESS_TOKEN or PHONE_NUMBER_ID in environment.");
-}
-// 1. Webhook Verification
+const userSession = {};
+
+// Session timeout: 5 minutes
+const SESSION_TIMEOUT = 5 * 60 * 1000;
+
+// ==========================================
+// WEBHOOK VERIFICATION
+// ==========================================
 app.get('/webhook', (req, res) => {
     const mode = req.query['hub.mode'];
     const token_sent = req.query['hub.verify_token'];
@@ -22,118 +27,120 @@ app.get('/webhook', (req, res) => {
 
     if (mode && token_sent === verify_token) {
         res.status(200).send(challenge);
-        console.log('Connected');
-
+        console.log('Webhook verified successfully');
     } else {
         res.sendStatus(403);
-        console.log('Not Connected');
+        console.log('Webhook verification failed');
     }
 });
 
-// 2. Receiving Messages & Logic
+// ==========================================
+// RECEIVING MESSAGES
+// ==========================================
 app.post('/webhook', async (req, res) => {
     const value = req.body.entry?.[0]?.changes?.[0]?.value;
     const message = value?.messages?.[0];
 
+
     if (message) {
         const from = message.from;
 
+        // Check if user has active session
+        if (userSession[from] && Date.now() - userSession[from].loginTime < SESSION_TIMEOUT) {
+            // User is logged in - handle menu options
+            if (message.type === 'text') {
+                const msg_body = message.text.body.trim();
+
+                // Handle Self BV inputs
+                if (userState[from] === 'WAITING_FORM_NO') {
+                    if (msg_body.toLowerCase() === 'cancel') {
+                        await sendReply(from, "❌ Action cancelled.");
+                        delete userState[from];
+                        await sendMainMenu(from);
+                        return;
+                    }
+                    if (!userData[from]) userData[from] = {};
+                    userData[from].formNo = msg_body;
+                    await sendReply(from, "📅 Great! Now enter FROM DATE (DD/MM/YYYY):\n\nType 'cancel' to cancel.");
+                    userState[from] = 'WAITING_FROM_DATE';
+                } else if (userState[from] === 'WAITING_FROM_DATE') {
+                    if (msg_body.toLowerCase() === 'cancel') {
+                        await sendReply(from, "❌ Action cancelled.");
+                        delete userState[from];
+                        await sendMainMenu(from);
+                        return;
+                    }
+                    if (!userData[from]) userData[from] = {};
+                    userData[from].fromDate = msg_body;
+                    await sendReply(from, "📅 Great! Now enter TO DATE (DD/MM/YYYY):\n\nType 'cancel' to cancel.");
+                    userState[from] = 'WAITING_TO_DATE';
+                } else if (userState[from] === 'WAITING_TO_DATE') {
+                    if (msg_body.toLowerCase() === 'cancel') {
+                        await sendReply(from, "❌ Action cancelled.");
+                        delete userState[from];
+                        await sendMainMenu(from);
+                        return;
+                    }
+                    if (!userData[from]) userData[from] = {};
+                    userData[from].toDate = msg_body;
+                    await fetchSelfBVDetails(from);
+                } else if (userState[from] === 'WAITING_FORGOT_ID') {
+                    if (msg_body.toLowerCase() === 'cancel') {
+                        await sendReply(from, "❌ Action cancelled.");
+                        delete userState[from];
+                        await sendMainMenu(from);
+                        return;
+                    }
+                    if (!userData[from]) userData[from] = {};
+                    userData[from].forgotId = msg_body;
+                    await sendForgotPassword(from);
+                } else if (msg_body === '#') {
+                    // Go back to menu
+                    await sendMainMenu(from);
+                } else {
+                    await handleMenuSelection(from, msg_body);
+                }
+            }
+            res.sendStatus(200);
+            return;
+        } else if (userSession[from]) {
+            // Session expired
+            delete userSession[from];
+            delete userState[from];
+            delete userData[from];
+        }
+
+        // Handle text messages
         if (message.type === 'text') {
             const msg_body = message.text.body.trim();
 
-            if (userState[from] === 'WAITING_FOR_NUMBER') {
-                await verifyMobileAPI(from, msg_body);
-
-            } else if (userState[from] === 'WAITING_FOR_ID') {
-                userData[from] = { id: msg_body };
-                await verifyAssociatedId(from, msg_body);
+            if (userState[from] === 'WAITING_FOR_ID') {
+                if (!userData[from]) userData[from] = {};
+                userData[from].id = msg_body;
+                await sendReply(from, "Great! 👍\n\nNow please enter your Password:");
+                userState[from] = 'WAITING_FOR_PASSWORD';
 
             } else if (userState[from] === 'WAITING_FOR_PASSWORD') {
-                // Maan lijiye password "1234" hai
-                if (msg_body === "1234") {
-                    // Login Success! Ab dashboard data dikhayenge
-                    await sendReply(from, "Login Successful! 🎉 Welcome Kuldeep Mathur.");
-                    // Yahan hum dashboard ka summary bhej rahe hain
-                    const dashboardMsg = `📊 *Your Dashboard Summary*\n\n👤 ID: ${userData[from]?.id || 'N/A'}\n💰 Self BV: 0.00\n⬅️ Left BV: 2601.00\n➡️ Right BV: 0.00\n📦 GBV: 2601.00`;
-                    await sendReply(from, dashboardMsg);
-                    // Show main menu after login
-                    await sendMainMenu(from);
-                    userState[from] = 'LOGGED_IN_MENU';
-                } else {
-                    await sendPasswordErrorOptions(from);
-                }
+                await handleLogin(from, msg_body);
 
-            } else if (userState[from] === 'LOGGED_IN_MENU') {
-                await handleMainMenuSelection(from, msg_body);
-
-            } else if (userState[from] === 'WAITING_FROM_DATE') {
-                if (!userData[from]) userData[from] = {};
-                userData[from].fromDate = msg_body;
-                await sendReply(from, "Please enter TO DATE (DD/MM/YYYY):");
-                userState[from] = 'WAITING_TO_DATE';
-
-            } else if (userState[from] === 'WAITING_TO_DATE') {
-                if (!userData[from]) userData[from] = {};
-                userData[from].toDate = msg_body;
-                await sendBVDateOptions(from);
-                userState[from] = 'BV_DATE_SELECTED';
-
-            } else if (userState[from] === 'WAITING_FOR_FORGOT_ID') {
-                await handleForgotPasswordAPI(from, msg_body);
-
-            } else if (['hi', 'hii', 'hello', 'hy'].includes(msg_body.toLowerCase())) {
-                await sendWelcomeOptions(from);
+            } else if (['hi', 'hii', 'hello', 'hey', 'hy'].includes(msg_body.toLowerCase())) {
+                await sendWelcomeMessage(from);
+            } else {
+                await sendReply(from, "Please type 'hi' to start the conversation.");
             }
         }
 
+        // Handle button replies
         else if (message.type === 'interactive' && message.interactive.type === 'button_reply') {
             const buttonId = message.interactive.button_reply.id;
 
             if (buttonId === 'btn_existing') {
-                await sendReply(from, "Please enter your registered number:");
-                userState[from] = 'WAITING_FOR_NUMBER';
-
-            } else if (buttonId === 'btn_try_again') {
-                // FIX: Ab ye seedha password maangega
-                await sendReply(from, "Please enter your password again:");
-                userState[from] = 'WAITING_FOR_PASSWORD';
+                await sendReply(from, "Great! 😊\n\nPlease enter your ID Number:");
+                userState[from] = 'WAITING_FOR_ID';
 
             } else if (buttonId === 'btn_new') {
-                await sendRegisterButton(from, "Welcome! Please register here:");
+                await sendRegisterButton(from, "Welcome! Please register here to get started:");
                 delete userState[from];
-
-            } else if (buttonId === 'btn_forgot_pw') {
-                await sendReply(from, "Please enter your User ID for password recovery:");
-                userState[from] = 'WAITING_FOR_FORGOT_ID';
-
-            } else if (buttonId === 'menu_1' || buttonId === 'menu_view_bv') {
-                await sendReply(from, "Please enter FROM DATE (DD/MM/YYYY):");
-                userState[from] = 'WAITING_FROM_DATE';
-
-            } else if (buttonId === 'menu_2' || buttonId === 'menu_team_bv') {
-                await showTeamBV(from);
-
-            } else if (buttonId === 'menu_3' || buttonId === 'menu_documents') {
-                await showDocuments(from);
-
-            } else if (buttonId === 'menu_4' || buttonId === 'menu_products') {
-                await showProducts(from);
-
-            } else if (buttonId === 'menu_5' || buttonId === 'menu_payout') {
-                await showPayout(from);
-
-            } else if (buttonId === 'menu_6' || buttonId === 'menu_logout') {
-                await handleLogout(from);
-
-            } else if (buttonId === 'btn_go_back') {
-                await sendMainMenu(from);
-                userState[from] = 'LOGGED_IN_MENU';
-
-            } else if (buttonId === 'btn_proceed') {
-                await showBVReport(from);
-
-            } else if (buttonId === 'btn_export') {
-                await exportBVReport(from);
             }
         }
     }
@@ -141,164 +148,309 @@ app.post('/webhook', async (req, res) => {
 });
 
 // ==========================================
-// API LOGIC
+// LOGIN API HANDLER
 // ==========================================
-
-async function verifyMobileAPI(from, mobileNumber) {
+async function handleLogin(from, password) {
     try {
-        const apiUrl = `http://www.darjuv9.com/webservice/Service.asmx/VerificationMobileNo?RegistrationMobileNo=${mobileNumber}&DeviceMobileNo=${mobileNumber}&IMEINo=&ConnectThru=&OperatorName=&OperatorCountry=&SIMSerialNo=&SIMSubscriberId=&SIMIMEINo=&HType=&vrsion=&DeviceModel=&DeviceName=`;
-        const response = await axios.get(apiUrl);
-        const data = response.data[0];
+        const userId = userData[from]?.id;
+        console.log('userId', userId);
 
-        if (data && data.Status === "true") {
-            await sendReply(from, "User successfully verified! ✅\nPlease enter your associated ID:");
-            userState[from] = 'WAITING_FOR_ID';
-        } else {
-            await sendReply(from, "This number does not exist.");
+        if (!userId) {
+            await sendReply(from, "Error: User ID not found. Please start again by typing 'hi'.");
             delete userState[from];
+            return;
         }
-    } catch (e) { await sendReply(from, "Server error."); }
-}
 
-async function verifyAssociatedId(from, idString) {
-    try {
-        const apiUrl = `http://www.darjuv9.com/webservice/Service.asmx/CheckPlaceUplinerId?PlaceUplinerId=${idString}`;
+        await sendReply(from, "🔄 Logging in... Please wait.");
+
+        const apiUrl = `${BASE_URL}/LoginMember?IDNo=${userId}&Password=${password}`;
         const response = await axios.get(apiUrl);
-        const data = response.data[0];
+        const data = response.data;
+        console.log('login data', data);
 
-        if (data && data.Status === "true") {
-            await sendReply(from, `ID verified: ${data.MemName} 🎉\nPlease enter your password:`);
-            userState[from] = 'WAITING_FOR_PASSWORD';
-        } else {
-            await sendReply(from, "ID does not exist.");
-            delete userState[from];
-        }
-    } catch (e) { await sendReply(from, "Server error."); }
-}
-
-async function handleForgotPasswordAPI(from, userId) {
-    try {
-        const apiUrl = `http://www.darjuv9.com/webservice/Service.asmx/ForgotPassword?IDNo=${userId}&DeviceID=${from}`;
-        const response = await axios.get(apiUrl);
-        const data = response.data[0];
-
+        // Check if login successful
         if (data && data.Status === "True") {
-            await sendReply(from, data.Message);
-            await sendReply(from, "Please enter your password now or click Forgot Password again:");
-            userState[from] = 'WAITING_FOR_PASSWORD';
-        } else {
-            await sendReply(from, "Failed to recover password. Please check your ID.");
+            const userInfo = data.Data && data.Data.length > 0 ? data.Data[0] : {};
+
+            // Store session
+            userSession[from] = {
+                loginTime: Date.now(),
+                userId: userId,
+                userInfo: userInfo
+            };
+
+            // Send success message with user details
+            const welcomeMsg = `✅ *Login Successful!*\n\n${data.Message}\n\n👤 Welcome ${userInfo.MemFirstName || userInfo.Name || 'User'}!\n\n📊 *Your Details:*\n🆔 ID: ${userInfo.IDNo || userId}\n📧 Email: ${userInfo.Email || 'N/A'}\n📱 Mobile: ${userInfo.Mobl || userInfo.Mobile || 'N/A'}\n📝 Form Number: ${userInfo.FormNo || 'N/A'}\n\n⏰ Session valid for 5 minutes.`;
+
+            await sendReply(from, welcomeMsg);
+
+            // Show main menu
+            await sendMainMenu(from);
+
+            // Clear state
             delete userState[from];
+
+            // Auto logout after 5 minutes
+            setTimeout(() => {
+                if (userSession[from]) {
+                    delete userSession[from];
+                    delete userData[from];
+                    sendReply(from, "⏰ Your session has expired. Please type 'hi' to login again.");
+                }
+            }, SESSION_TIMEOUT);
+
+        } else {
+            // Login failed
+            const errorMsg = data?.Message || "Invalid ID or Password";
+            await sendReply(from, `❌ Login Failed!\n\n${errorMsg}\n\nPlease try again by typing 'hi'.`);
+            delete userState[from];
+            delete userData[from];
         }
-    } catch (e) { await sendReply(from, "Server error."); }
-}
 
-// ==========================================
-// MAIN MENU & FEATURES
-// ==========================================
-
-async function sendMainMenu(to) {
-    const menuText = `📋 *Main Menu*\n\nPlease select an option:\n\n1️⃣ View Self BV\n2️⃣ Know Your Team BV\n3️⃣ Download Documents\n4️⃣ Know About Products\n5️⃣ Know Your Payout\n6️⃣ Logout\n\nYou can click buttons below or type a number (1-6):`;
-    
-    await sendButtons(to, menuText, [
-        { id: "menu_1", title: "View Self BV" },
-        { id: "menu_2", title: "Team BV" },
-        { id: "menu_3", title: "Documents" }
-    ]);
-}
-
-async function handleMainMenuSelection(from, input) {
-    const choice = input.trim();
-    
-    if (choice === '1') {
-        await sendReply(from, "Please enter FROM DATE (DD/MM/YYYY):");
-        userState[from] = 'WAITING_FROM_DATE';
-    } else if (choice === '2') {
-        await showTeamBV(from);
-    } else if (choice === '3') {
-        await showDocuments(from);
-    } else if (choice === '4') {
-        await showProducts(from);
-    } else if (choice === '5') {
-        await showPayout(from);
-    } else if (choice === '6') {
-        await handleLogout(from);
-    } else {
-        await sendReply(from, "Invalid option. Please type a number between 1-6 or use the buttons.");
-        await sendMainMenu(from);
+    } catch (error) {
+        console.error("Login Error:", error.message);
+        await sendReply(from, "⚠️ Server error occurred. Please try again later.");
+        delete userState[from];
     }
 }
 
-async function sendBVDateOptions(to) {
-    const fromDate = userData[to]?.fromDate || 'N/A';
-    const toDate = userData[to]?.toDate || 'N/A';
-    
-    await sendButtons(to, `📅 Date Range Selected:\n\nFrom: ${fromDate}\nTo: ${toDate}\n\nWhat would you like to do?`, [
-        { id: "btn_proceed", title: "Proceed" },
-        { id: "btn_export", title: "Export" },
-        { id: "btn_go_back", title: "Go Back" }
-    ]);
+// ==========================================
+// MAIN MENU & MENU HANDLER
+// ==========================================
+
+async function sendMainMenu(to) {
+    const menuMsg = `📋 *What would you like to do?*\n\n1️⃣ View Self BV\n2️⃣ Know About Team BV\n3️⃣ Download Document Link\n4️⃣ Know About Product\n5️⃣ Know Your Payout\n6️⃣ Forget Password\n7️⃣ Logout\n\n💡 Please enter a number (1-7) to select an option.`;
+    await sendReply(to, menuMsg);
 }
 
-async function showBVReport(from) {
-    const fromDate = userData[from]?.fromDate || 'N/A';
-    const toDate = userData[from]?.toDate || 'N/A';
-    
-    const reportMsg = `📊 *Self BV Report*\n\n📅 Period: ${fromDate} to ${toDate}\n\n💰 Total BV: 1,250.00\n📈 Daily Average: 41.67\n🎯 Target: 2,000.00\n📉 Remaining: 750.00\n\n✅ Status: On Track`;
-    
-    await sendReply(from, reportMsg);
-    await sendGoBackButton(from);
+async function handleMenuSelection(from, input) {
+    const choice = input.trim();
+
+    // Validate input is a number between 1-7
+    if (!/^[1-7]$/.test(choice)) {
+        await sendReply(from, "❌ Invalid option!\n\nPlease enter a number between 1 and 7.");
+        await sendMainMenu(from);
+        return;
+    }
+
+    switch (choice) {
+        case '1':
+            await showSelfBV(from);
+            break;
+        case '2':
+            await showTeamBV(from);
+            break;
+        case '3':
+            await showDocumentLink(from);
+            break;
+        case '4':
+            await showProducts(from);
+            break;
+        case '5':
+            await showPayout(from);
+            break;
+        case '6':
+            await handleForgetPassword(from);
+            break;
+        case '7':
+            await handleLogout(from);
+            break;
+    }
 }
 
-async function exportBVReport(from) {
-    const fromDate = userData[from]?.fromDate || 'N/A';
-    const toDate = userData[from]?.toDate || 'N/A';
-    
-    await sendReply(from, `📥 *Exporting BV Report*\n\nPeriod: ${fromDate} to ${toDate}\n\n✅ Your report has been generated!\n📧 Report will be sent to your registered email within 5 minutes.\n\n📄 Format: PDF`);
-    await sendGoBackButton(from);
+// ==========================================
+// MENU OPTIONS FUNCTIONS
+// ==========================================
+
+async function showSelfBV(from) {
+    await sendReply(from, "📝 *View Self BV*\n\nPlease enter your FORM NUMBER:\n\nExample: 123456\n\nType 'cancel' to cancel.");
+    userState[from] = 'WAITING_FORM_NO';
+}
+
+async function fetchSelfBVDetails(from) {
+    try {
+        const formNo = userData[from]?.formNo;
+        const fromDate = userData[from]?.fromDate;
+        const toDate = userData[from]?.toDate;
+
+        if (!formNo) {
+            await sendReply(from, "❌ Error: Form Number is required.");
+            delete userState[from];
+            await sendMainMenu(from);
+            return;
+        }
+
+        // Validate date format (basic validation)
+        const dateRegex = /^\d{2}\/\d{2}\/\d{4}$/;
+        if (!dateRegex.test(fromDate) || !dateRegex.test(toDate)) {
+            await sendReply(from, "❌ Invalid date format!\n\nPlease use DD/MM/YYYY format.\n\nExample: 12/02/2026");
+            delete userState[from];
+            await sendMainMenu(from);
+            return;
+        }
+
+        await sendReply(from, "🔄 Fetching your Self BV details... Please wait.");
+
+        const apiUrl = `${BASE_URL}/SelfPVDetails?FormNo=${formNo}&FromDate=${fromDate}&ToDate=${toDate}`;
+        console.log('Self BV API URL:', apiUrl);
+
+        const response = await axios.get(apiUrl);
+        const data = response.data;
+        console.log('Self BV Response:', data);
+
+        if (data && data.Status === "True") {
+            const bvData = data.Data && data.Data.length > 0 ? data.Data : [];
+
+            if (bvData.length === 0) {
+                await sendReply(from, `📄 *Self BV Report*\n\n📅 Period: ${fromDate} to ${toDate}\n📝 Form No: ${formNo}\n\nℹ️ No records found for this date range.`);
+            } else {
+                let reportMsg = `📊 *Self BV Report*\n\n📅 Period: ${fromDate} to ${toDate}\n📝 Form No: ${formNo}\n\n`;
+
+                // Display BV details
+                bvData.forEach((item, index) => {
+                    reportMsg += `📌 Record ${index + 1}:\n`;
+                    reportMsg += `Date: ${item.Date || 'N/A'}\n`;
+                    reportMsg += `BV: ${item.BV || '0.00'}\n`;
+                    reportMsg += `Amount: ₹${item.Amount || '0.00'}\n`;
+                    reportMsg += `\n`;
+                });
+
+                await sendReply(from, reportMsg);
+            }
+        } else {
+            const errorMsg = data?.Message || "Unable to fetch BV details";
+            await sendReply(from, `❌ ${errorMsg}\n\nPlease try again later.\n\nPress # to go back to menu.`);
+        }
+
+        // Clear state and show menu
+        delete userState[from];
+        await sendReply(from, "\n\nPress # to go back to menu.");
+
+    } catch (error) {
+        console.error("Self BV Error:", error.message);
+        await sendReply(from, "⚠️ Server error occurred while fetching BV details.\n\nPlease try again later.\n\nPress # to go back to menu.");
+        delete userState[from];
+    }
 }
 
 async function showTeamBV(from) {
-    const teamMsg = `👥 *Team BV Summary*\n\n⬅️ Left Team BV: 2,601.00\n➡️ Right Team BV: 1,850.00\n📦 Total Team BV: 4,451.00\n\n👤 Active Members: 15\n🆕 New Joinings: 3\n🎯 Team Target: 10,000.00`;
-    
+    const teamMsg = `👥 *Team BV Summary*\n\n⬅️ Left Team BV: 2,601.00\n➡️ Right Team BV: 1,850.00\n📦 Total Team BV: 4,451.00\n\n👤 Active Members: 15\n🆕 New Joinings: 3\n🎯 Team Target: 10,000.00\n\nPress # to go back to menu.`;
     await sendReply(from, teamMsg);
-    await sendGoBackButton(from);
 }
 
-async function showDocuments(from) {
-    const docMsg = `📄 *Download Documents*\n\n1. ID Card\n2. Certificate\n3. Tax Documents\n4. Agreement Copy\n5. Product Catalog\n\n🔗 Click below to access:`;
-    
+async function showDocumentLink(from) {
+    const docMsg = `📄 *Download Documents*\n\n1. ID Card\n2. Certificate\n3. Tax Documents\n4. Agreement Copy\n5. Product Catalog\n\nPress # to go back to menu.`;
     await sendReply(from, docMsg);
-    await sendDocumentLink(from);
+    await sendDocumentLinkButton(from);
 }
 
 async function showProducts(from) {
-    const productMsg = `🛍️ *Our Products*\n\n1. *Health Supplement A*\n   💰 Price: ₹1,500\n   📦 BV: 50\n\n2. *Wellness Pack B*\n   💰 Price: ₹3,000\n   📦 BV: 120\n\n3. *Premium Kit C*\n   💰 Price: ₹5,000\n   📦 BV: 200\n\n✨ All products are 100% natural and certified!`;
-    
+    const productMsg = `🛍️ *Our Products*\n\n1. *Health Supplement A*\n   💰 Price: ₹1,500\n   📦 BV: 50\n\n2. *Wellness Pack B*\n   💰 Price: ₹3,000\n   📦 BV: 120\n\n3. *Premium Kit C*\n   💰 Price: ₹5,000\n   📦 BV: 200\n\n✨ All products are 100% natural and certified!\n\nPress # to go back to menu.`;
     await sendReply(from, productMsg);
-    await sendGoBackButton(from);
 }
 
 async function showPayout(from) {
-    const payoutMsg = `💵 *Your Payout Details*\n\n📅 Current Month: January 2025\n💰 Total Earning: ₹8,500.00\n✅ Paid Amount: ₹6,000.00\n⏳ Pending: ₹2,500.00\n\n📊 Breakdown:\n• Direct Income: ₹3,000\n• Level Income: ₹2,500\n• Matching Bonus: ₹3,000\n\n💳 Next Payout: 5th Feb 2025`;
-    
-    await sendReply(from, payoutMsg);
-    await sendGoBackButton(from);
+    try {
+        const userInfo = userSession[from]?.userInfo || {};
+        const FormNo = userInfo.FormNo;
+
+        if (!FormNo) {
+            await sendReply(from, "❌ Error: Form Number not found in your profile.\n\nPlease contact support.");
+            await sendMainMenu(from);
+            return;
+        }
+
+        await sendReply(from, "🔄 Fetching your payout details... Please wait.");
+
+        const apiUrl = `${BASE_URL}/WeeklyPayout?FormNo=${FormNo}`;
+        console.log('Payout API URL:', apiUrl);
+
+        const response = await axios.get(apiUrl);
+        const data = response.data;
+        console.log('Payout Response:', data);
+
+        if (data && data.Status === "True") {
+            const payoutData = data.Data && data.Data.length > 0 ? data.Data : [];
+
+            if (payoutData.length === 0) {
+                await sendReply(from, `💵 *Your Payout Details*\n\n📝 Form No: ${formNo}\n\nℹ️ No payout records found.`);
+            } else {
+                let payoutMsg = `💵 *Your Payout Details*\n\n📝 Form No: ${formNo}\n\n`;
+
+                // Display payout details
+                payoutData.forEach((item, index) => {
+                    payoutMsg += `📌 Payout ${index + 1}:\n`;
+                    payoutMsg += `Week: ${item.Week || 'N/A'}\n`;
+                    payoutMsg += `Date: ${item.Date || 'N/A'}\n`;
+                    payoutMsg += `Amount: ₹${item.Amount || '0.00'}\n`;
+                    payoutMsg += `Status: ${item.Status || 'N/A'}\n`;
+                    payoutMsg += `\n`;
+                });
+
+                await sendReply(from, payoutMsg);
+            }
+        } else {
+            const errorMsg = data?.Message || "Unable to fetch payout details";
+            await sendReply(from, `❌ ${errorMsg}\n\nPlease try again later.\n\nPress # to go back to menu.`);
+        }
+
+        await sendMainMenu(from);
+
+    } catch (error) {
+        console.error("Payout Error:", error.message);
+        await sendReply(from, "⚠️ Server error occurred while fetching payout details.\n\nPlease try again later.\n\nPress # to go back to menu.");
+    }
+}
+
+async function handleForgetPassword(from) {
+    await sendReply(from, "🔐 *Forget Password*\n\n*Please enter your ID NUMBER:*\n\nExample: 0001XXXXXXX\n\nType 'cancel' to cancel.");
+    userState[from] = 'WAITING_FORGOT_ID';
+}
+
+async function sendForgotPassword(from) {
+    try {
+        const idNo = userData[from]?.forgotId;
+        const deviceId = from; // WhatsApp number as device ID
+
+        if (!idNo) {
+            await sendReply(from, "❌ Error: ID Number is required.");
+            delete userState[from];
+            await sendMainMenu(from);
+            return;
+        }
+
+        await sendReply(from, "🔄 Sending password reset request... Please wait.");
+
+        const apiUrl = `${BASE_URL}/ForgotPassword?IDNo=${idNo}&DeviceID=${deviceId}`;
+        console.log('Forgot Password API URL:', apiUrl);
+
+        const response = await axios.get(apiUrl);
+        const data = response.data;
+        console.log('Forgot Password Response:', data);
+
+        if (data && data.Status === "True") {
+            await sendReply(from, `✅ ${data.Message || 'Password reset request sent successfully!'}\n\nPlease check your registered mobile/email.\n\nPress # to go back to menu.`);
+        } else {
+            const errorMsg = data?.Message || "Unable to process password reset request";
+            await sendReply(from, `❌ ${errorMsg}\n\nPlease try again later.\n\nPress # to go back to menu.`);
+        }
+
+        delete userState[from];
+
+    } catch (error) {
+        console.error("Forgot Password Error:", error.message);
+        await sendReply(from, "⚠️ Server error occurred while processing your request.\n\nPlease try again later.\n\nPress # to go back to menu.");
+        delete userState[from];
+    }
 }
 
 async function handleLogout(from) {
-    await sendReply(from, "👋 You have been logged out successfully!\n\nThank you for using our service. Type 'hi' to start again.");
-    delete userState[from];
+    delete userSession[from];
     delete userData[from];
+    await sendReply(from, "👋 *Logged Out Successfully!*\n\nThank you for using our service.\n\nType 'hi' to login again.");
 }
 
-async function sendGoBackButton(to) {
-    await sendButtons(to, "Choose an option:", [
-        { id: "btn_go_back", title: "🔙 Go Back to Menu" }
-    ]);
-}
-
-async function sendDocumentLink(to) {
+async function sendDocumentLinkButton(to) {
     try {
         await axios.post(`https://graph.facebook.com/v21.0/${phone_number_id}/messages`, {
             messaging_product: "whatsapp",
@@ -306,32 +458,29 @@ async function sendDocumentLink(to) {
             type: "interactive",
             interactive: {
                 type: "cta_url",
-                body: { text: "Access all your documents here:" },
+                body: { text: "Click below to access all documents:" },
                 action: {
                     name: "cta_url",
-                    parameters: { display_text: "Download Documents", url: "https://www.darjuv9.com/documents" }
+                    parameters: {
+                        display_text: "Download Documents",
+                        url: "https://www.darjuv9.com/documents"
+                    }
                 }
             }
         }, { headers: { Authorization: `Bearer ${token}` } });
-        await sendGoBackButton(to);
-    } catch (e) { console.error("Document Link Error"); }
+    } catch (error) {
+        console.error("Document Link Error:", error.message);
+    }
 }
 
 // ==========================================
 // HELPER FUNCTIONS
 // ==========================================
 
-async function sendWelcomeOptions(to) {
-    await sendButtons(to, "Welcome to the bot! Are you an existing or new user?", [
+async function sendWelcomeMessage(to) {
+    await sendButtons(to, "👋 Welcome to Darjuv9 Bot!\n\nAre you an existing user or a new user?", [
         { id: "btn_existing", title: "Existing User" },
         { id: "btn_new", title: "New User" }
-    ]);
-}
-
-async function sendPasswordErrorOptions(to) {
-    await sendButtons(to, "Password is incorrect! ❌\nKya aap dobara koshish karna chahte hain ya password bhool gaye?", [
-        { id: "btn_try_again", title: "Try Again" },
-        { id: "btn_forgot_pw", title: "Forgot Password" }
     ]);
 }
 
@@ -352,7 +501,9 @@ async function sendButtons(to, text, buttons) {
                 }
             }
         }, { headers: { Authorization: `Bearer ${token}` } });
-    } catch (e) { console.error("Button Error:", e.response?.data || e.message); }
+    } catch (error) {
+        console.error("Button Error:", error.response?.data || error.message);
+    }
 }
 
 async function sendRegisterButton(to, messageText) {
@@ -366,11 +517,16 @@ async function sendRegisterButton(to, messageText) {
                 body: { text: messageText },
                 action: {
                     name: "cta_url",
-                    parameters: { display_text: "Register Here", url: "https://www.darjuv9.com/JoiningForm2024/Memberjoining_New_Update.aspx" }
+                    parameters: {
+                        display_text: "Register Here",
+                        url: "https://www.darjuv9.com/JoiningForm2024/Memberjoining_New_Update.aspx"
+                    }
                 }
             }
         }, { headers: { Authorization: `Bearer ${token}` } });
-    } catch (e) { console.error("URL Button Error"); }
+    } catch (error) {
+        console.error("URL Button Error:", error.message);
+    }
 }
 
 async function sendReply(to, text) {
@@ -380,7 +536,16 @@ async function sendReply(to, text) {
             to: to,
             text: { body: text },
         }, { headers: { Authorization: `Bearer ${token}` } });
-    } catch (e) { console.error("Text Error"); }
+    } catch (error) {
+        console.error("Text Error:", error.message);
+    }
 }
 
-app.listen(3000, () => console.log('Server is listening on port 3000'));
+// ==========================================
+// START SERVER
+// ==========================================
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+    console.log(`✅ Server is running on port ${PORT}`);
+    console.log(`📱 WhatsApp Bot is ready!`);
+});
